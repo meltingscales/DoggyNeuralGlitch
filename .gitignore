@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+output/
+test_output/
+*.wav
+*.mp3
+*.gif
+*.mp4
+.uv/
+uv.lock
