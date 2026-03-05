@@ -16,7 +16,7 @@ While true 1-bit LLMs processing raw audio don't exist yet, this project demonst
 - Applies audio-driven corruption effects
 - Outputs unique glitch art frames (one per audio chunk)
 - Runs entirely on CPU with ~50-80MB RAM
-- Generates frames at 2-5 FPS; plays back at 30+ FPS from saved frames
+- Generates at 30 FPS (0.033s chunks) and exports directly to MP4 via ffmpeg
 
 The name "Doggy" reflects the philosophy: neural networks are good boys who sometimes make beautiful mistakes.
 
@@ -26,7 +26,7 @@ The name "Doggy" reflects the philosophy: neural networks are good boys who some
 
 ### Pipeline Overview
 ```
-Audio File → Audio Processing → Neural Core → Glitch Effects → PNG Frames
+Audio File → Audio Processing → Base Image (Plasma / VAE blend) → Glitch Effects → PNG Frames → MP4
 ```
 
 ### Component 1: Audio Processing (librosa)
@@ -47,7 +47,7 @@ Audio File → Audio Processing → Neural Core → Glitch Effects → PNG Frame
 - Sample rate: 22050 Hz
 - Hop length: 512 samples
 - N_MFCC: 13 coefficients
-- Chunk duration: 0.5 seconds (configurable)
+- Chunk duration: 0.0333 seconds (default = 1/30fps, configurable)
 
 ### Component 2: Neural Core (PyTorch)
 
@@ -77,14 +77,14 @@ where std = exp(0.5 * logvar)
       epsilon ~ N(0, 1)
 ```
 
-**Chaos Mode**: 
-- Generate directly from noise seed derived from audio intensity
-- Skip encoder, just use: `z = torch.randn(batch_size, 64)` with specific seed
+**Chaos Mode**:
+- Pure audio-driven plasma — VAE is skipped entirely
+- Plasma frequencies/phases seeded directly from audio features
 
 **Initialization**:
-- Xavier normal initialization with gain=0.5 (for subtle effects)
-- Fixed seed (42069) for reproducible chaos
-- **NO TRAINING REQUIRED** - random weights create interesting glitch art!
+- Xavier normal initialization with gain=2.0 (saturates activations for visual interest)
+- Fixed seed (42069) for reproducible results
+- **NO TRAINING REQUIRED** - VAE acts as a texture layer over the plasma base
 
 **Total Parameters**: ~400,000 (encoder ~33k + conv decoder ~360k)
 **Model Size**: ~2-4 MB
@@ -128,13 +128,13 @@ where std = exp(0.5 * logvar)
 
 **Audio-to-Effect Mapping (Mixed Mode)**:
 ```python
-if bass_intensity > 0.6:
+if bass_intensity > 0.3:
     apply block glitches (structural changes)
 
-if treble_intensity > 0.5:
+if treble_intensity > 0.25:
     apply RGB split (detail changes)
 
-if mid_intensity > 0.4:
+if mid_intensity > 0.2:
     apply bitcrush (tonal changes)
 
 always:
@@ -153,7 +153,7 @@ if random() < intensity:
 SAMPLE_RATE = 22050
 HOP_LENGTH = 512
 N_MFCC = 13
-CHUNK_DURATION = 0.5
+CHUNK_DURATION = 0.5       # override via --chunk-duration; justfile default is 0.0333
 IMAGE_SIZE = (512, 512)
 LATENT_DIM = 64
 DECODER_CHANNELS = [64, 32, 16, 8, 3]  # ConvTranspose2d channel progression
@@ -165,6 +165,7 @@ USE_GPU = False
 - cyberpunk: [(255,0,110), (0,255,255), (255,255,0)]
 - grayscale: Evenly spaced grays
 - demoscene: [(0,255,0), (255,0,255), (0,255,255)]
+- drakonix: deep navy, dark navy, bright purple, lilac, cyan, light cyan, medium purple, pale lavender, off-white
 
 **Effect Weights** (for mixed mode):
 ```python
@@ -184,16 +185,15 @@ EFFECT_WEIGHTS = {
 ```
 DoggyNeuralGlitch/
 ├── README.md              # This file - complete specification
-├── QUICKSTART.md          # 5-minute getting started guide
-├── ARCHITECTURE.md        # Deep technical documentation
-├── EXAMPLES.md            # 10 usage examples
 ├── LICENSE                # MIT license
-├── requirements.txt       # Python dependencies
-├── .gitignore            # Git ignore rules
-├── config.py             # Configuration class with ASCII art banner
-├── neural_core.py        # Tiny VAE network implementation
+├── pyproject.toml         # uv project + dependencies
+├── requirements.txt       # Pip-compatible dependency list
+├── justfile               # Dev task runner (just run, just test, etc.)
+├── .gitignore
+├── config.py             # Config class, color palettes, ASCII art banner
+├── neural_core.py        # Tiny VAE (encoder + conv decoder)
 ├── glitch_effects.py     # 7 glitch effects + AudioDrivenGlitcher
-├── main.py               # Main entry point and processing pipeline
+├── main.py               # Pipeline: plasma generator, VAE blend, CLI
 └── test.py               # Quick test with synthetic audio
 ```
 
@@ -232,23 +232,27 @@ scipy>=1.10.0
 
 ### Basic Command Line Usage
 ```bash
-# Process entire audio file
-uv run main.py --input song.mp3 --output ./output
+# Process entire audio file (30fps default)
+just run song.mp3
 
-# Limit to first 10 frames
-uv run main.py --input song.mp3 --max-frames 10
+# Convenience targets — one per main mode
+just run-mixed    song.mp3
+just run-chaos    song.mp3
+just run-neural   song.mp3
+just run-drakonix song.mp3
 
-# Pure chaos mode
-uv run main.py --input song.mp3 --mode chaos
+# Preview first 90 frames (~3 seconds at 30fps)
+just run-frames song.mp3 90
 
-# Different chunk duration
-uv run main.py --input song.mp3 --chunk-duration 1.0
+# Override fps / chunk duration together (must stay in sync: chunk-duration = 1/fps)
+just run song.mp3 ./output mixed 2 0.5
 ```
 
 ### Available Modes
-- `neural`: Use neural core to generate base images, then apply subtle effects
-- `chaos`: Pure random generation seeded by audio intensity
-- `mixed`: Intelligently combine multiple effects (DEFAULT)
+- `mixed`: Plasma base + all glitch effects, audio-driven (DEFAULT)
+- `neural`: Plasma + VAE texture blend, then glitch effects
+- `chaos`: Pure audio-driven plasma, no VAE, no glitch effects
+- `drakonix`: Fursona palette stripes + Perlin-style noise + glitch effects
 - `bitcrush`: Bit depth reduction only
 - `rgb_split`: RGB channel separation only
 - `datamosh`: Data corruption only
@@ -273,7 +277,7 @@ glitcher.process(
 
 ### Demoscene Principles
 1. **Small**: Total codebase <1000 lines, model <5MB
-2. **Fast**: 2-5 FPS generation on CPU; pre-generate then play back at full speed
+2. **Fast**: 30 FPS generation on CPU (0.033s chunks); exports directly to MP4
 3. **Cool**: Aesthetics over accuracy
 4. **Hackable**: Easy to understand and modify
 5. **Self-contained**: Minimal dependencies
@@ -300,11 +304,10 @@ The neural core with random weights acts as a **consistent but chaotic hash func
 ### Neural Core Implementation Notes
 
 **Why This Architecture?**
-- VAE structure creates smooth latent space (similar inputs → similar outputs)
-- Conv decoder (~400k params) stays demoscene-authentic while being feasible
-- Upsampling from 16×16 spatial base avoids the massive linear layer that a fully-connected decoder would require (which would be 200M+ params for 512×512×3 output)
+- The **plasma generator** is the primary visual driver: audio features map directly to sine wave frequencies/phases, guaranteeing colorful and audio-reactive output with no training
+- The **VAE acts as a texture layer** (blended 30% over plasma): its random weights with gain=2.0 produce complex nonlinear patterns that vary with the latent code
+- Conv decoder (~400k params) stays demoscene-authentic — a fully-connected decoder would need 200M+ params for 512×512×3 output
 - Tanh output naturally scales to image range with simple denormalization
-- Random weights provide enough complexity without training
 
 **Key Implementation Tricks**:
 1. **Feature padding**: MFCCs are padded/truncated to exactly 128 dimensions
@@ -406,19 +409,18 @@ def callback(indata, frames, time, status):
 ## Known Limitations
 
 1. **No GPU support**: Deliberately CPU-only
-2. **No GIF/video output**: Manual ffmpeg required
-3. **Fixed image size**: 512x512 (configurable but not runtime)
-4. **No pre-trained weights**: Uses random initialization (intentional — see Design Philosophy)
-5. **Generation rate capped by audio**: 0.5s chunks = max 2 frames/sec of audio coverage
-6. **Single-threaded**: No parallel processing
-7. **English-centric**: Comments and docs in English only
+2. **Fixed image size**: 512×512 (configurable in config.py, not at runtime)
+3. **No pre-trained weights**: Uses random initialization (intentional — see Design Philosophy)
+4. **Single-threaded**: No parallel processing
+5. **English-centric**: Comments and docs in English only
 
 ---
 
 ## Future Enhancements
 
 - [ ] 1-bit quantized model (even smaller!)
-- [ ] GIF/MP4 output built-in
+- [x] MP4 output via justfile + ffmpeg
+- [ ] GIF output built-in
 - [ ] Live visualizer GUI
 - [ ] MIDI controller support
 - [ ] StyleGAN integration option
@@ -433,15 +435,14 @@ def callback(indata, frames, time, status):
 **Tested on**: Modern x86_64 CPU (4 cores, 2.5GHz)
 
 - Model initialization: <1 second
-- Per-frame generation: 0.2-0.5 seconds (2-5 FPS generation rate)
-- Audio chunk rate: 2 frames/sec at 0.5s chunks (hard limit from audio input)
-- Playback FPS: 30+ (frames are pre-generated, then played back at any rate)
+- Per-frame generation: ~0.03-0.1 seconds at 30fps (0.033s chunks)
+- Generation rate: ~15-30 FPS observed on a modern x86_64 CPU
 - Memory usage: 50-80 MB (steady state)
 - Model size on disk: 2-4 MB
 
 **Bottlenecks**:
 1. Librosa feature extraction (~50% of time)
-2. Conv decoder forward pass (~25% of time)
+2. Plasma generation + VAE decode (~25% of time)
 3. Glitch effects (~15% of time)
 4. I/O (PNG save) (~10% of time)
 
@@ -478,8 +479,10 @@ To recreate this project from scratch using Claude:
 Key points to emphasize:
 - Demoscene philosophy (small, fast, cool)
 - CPU-only operation
-- Random weights (no training needed)
-- Audio-driven effects
+- Plasma generator as primary visual driver; VAE as texture layer (no training needed)
+- Audio-driven effects with lowered thresholds for dense glitch output
+- `drakonix` mode: fursona palette stripes + Perlin-style noise
+- 30 FPS default; MP4 export via justfile + ffmpeg
 - Conv decoder (~400k params, ~2-4MB, ~50-80MB RAM)
 
 ---
