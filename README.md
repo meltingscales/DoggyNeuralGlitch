@@ -12,11 +12,11 @@ While true 1-bit LLMs processing raw audio don't exist yet, this project demonst
 
 **DoggyNeuralGlitch** is a demoscene-inspired audio-to-visual glitch art generator that:
 - Takes MP3/WAV audio files as input
-- Processes them through a tiny neural network (~100k parameters, 15-20MB)
+- Processes them through a tiny neural network (~400k parameters, 2-4MB)
 - Applies audio-driven corruption effects
 - Outputs unique glitch art frames (one per audio chunk)
-- Runs entirely on CPU with ~80-100MB RAM
-- Generates at ~30-60 FPS
+- Runs entirely on CPU with ~50-80MB RAM
+- Generates frames at 2-5 FPS; plays back at 30+ FPS from saved frames
 
 The name "Doggy" reflects the philosophy: neural networks are good boys who sometimes make beautiful mistakes.
 
@@ -62,8 +62,13 @@ Audio File → Audio Processing → Neural Core → Glitch Effects → PNG Frame
 
 **Decoder**:
 - Input: 64-dim latent vector (from reparameterization)
-- Layers: Linear(64→64)→ReLU→Linear(64→128)→ReLU→Linear(128→256)→ReLU→Linear(256→786432)→Tanh
-- Output: 786432-dim vector (512×512×3 flattened) in range [-1, 1]
+- Linear(64→4096)→ReLU→Reshape(16, 16, 16) (spatial base)
+- ConvTranspose2d(16→64, 4×4, stride=2)→ReLU → (64, 32, 32)
+- ConvTranspose2d(64→32, 4×4, stride=2)→ReLU → (32, 64, 64)
+- ConvTranspose2d(32→16, 4×4, stride=2)→ReLU → (16, 128, 128)
+- ConvTranspose2d(16→8, 4×4, stride=2)→ReLU → (8, 256, 256)
+- ConvTranspose2d(8→3, 4×4, stride=2)→Tanh → (3, 512, 512)
+- Output: 512×512×3 image tensor in range [-1, 1]
 
 **Reparameterization Trick**:
 ```python
@@ -81,8 +86,8 @@ where std = exp(0.5 * logvar)
 - Fixed seed (42069) for reproducible chaos
 - **NO TRAINING REQUIRED** - random weights create interesting glitch art!
 
-**Total Parameters**: ~100,000 (much smaller than typical models)
-**Model Size**: ~15-20 MB
+**Total Parameters**: ~400,000 (encoder ~33k + conv decoder ~360k)
+**Model Size**: ~2-4 MB
 
 ### Component 3: Glitch Effects Pipeline
 
@@ -151,7 +156,7 @@ N_MFCC = 13
 CHUNK_DURATION = 0.5
 IMAGE_SIZE = (512, 512)
 LATENT_DIM = 64
-NEURAL_LAYERS = [256, 128, 64]
+DECODER_CHANNELS = [64, 32, 16, 8, 3]  # ConvTranspose2d channel progression
 USE_GPU = False
 ```
 
@@ -196,6 +201,13 @@ DoggyNeuralGlitch/
 
 ## Dependencies
 
+**Package manager**: [`uv`](https://github.com/astral-sh/uv) (recommended)
+
+```bash
+uv sync          # install all deps from pyproject.toml
+uv run main.py --input song.mp3 --output ./output
+```
+
 **requirements.txt**:
 ```
 numpy>=1.24.0
@@ -203,14 +215,13 @@ Pillow>=10.0.0
 librosa>=0.10.0
 soundfile>=0.12.0
 torch>=2.0.0
-torchvision>=0.15.0
 tqdm>=4.65.0
 scipy>=1.10.0
 ```
 
 **Key Libraries**:
 - `librosa`: Audio analysis and feature extraction
-- `torch`: Neural network (CPU-only)
+- `torch`: Neural network with conv decoder (CPU-only)
 - `numpy`: Array operations for glitch effects
 - `PIL`: Image I/O and basic manipulation
 - `soundfile`: Audio file I/O
@@ -222,16 +233,16 @@ scipy>=1.10.0
 ### Basic Command Line Usage
 ```bash
 # Process entire audio file
-python main.py --input song.mp3 --output ./output
+uv run main.py --input song.mp3 --output ./output
 
 # Limit to first 10 frames
-python main.py --input song.mp3 --max-frames 10
+uv run main.py --input song.mp3 --max-frames 10
 
 # Pure chaos mode
-python main.py --input song.mp3 --mode chaos
+uv run main.py --input song.mp3 --mode chaos
 
 # Different chunk duration
-python main.py --input song.mp3 --chunk-duration 1.0
+uv run main.py --input song.mp3 --chunk-duration 1.0
 ```
 
 ### Available Modes
@@ -261,8 +272,8 @@ glitcher.process(
 ## Design Philosophy
 
 ### Demoscene Principles
-1. **Small**: Total codebase <1000 lines, model <20MB
-2. **Fast**: Real-time capable on CPU-only
+1. **Small**: Total codebase <1000 lines, model <5MB
+2. **Fast**: 2-5 FPS generation on CPU; pre-generate then play back at full speed
 3. **Cool**: Aesthetics over accuracy
 4. **Hackable**: Easy to understand and modify
 5. **Self-contained**: Minimal dependencies
@@ -290,7 +301,8 @@ The neural core with random weights acts as a **consistent but chaotic hash func
 
 **Why This Architecture?**
 - VAE structure creates smooth latent space (similar inputs → similar outputs)
-- Tiny size (<100k params) keeps it demoscene-authentic
+- Conv decoder (~400k params) stays demoscene-authentic while being feasible
+- Upsampling from 16×16 spatial base avoids the massive linear layer that a fully-connected decoder would require (which would be 200M+ params for 512×512×3 output)
 - Tanh output naturally scales to image range with simple denormalization
 - Random weights provide enough complexity without training
 
@@ -329,7 +341,7 @@ return flat.reshape(original_shape)
 1. **No GPU**: Deliberately CPU-only for accessibility
 2. **Batch size 1**: Single-frame generation reduces memory
 3. **In-place operations**: NumPy operations reuse arrays when possible
-4. **Minimal model**: <100k parameters keeps inference fast
+4. **Minimal model**: ~400k parameters with conv decoder keeps inference fast
 5. **Chunk processing**: Process one audio chunk at a time
 
 ---
@@ -396,9 +408,10 @@ def callback(indata, frames, time, status):
 1. **No GPU support**: Deliberately CPU-only
 2. **No GIF/video output**: Manual ffmpeg required
 3. **Fixed image size**: 512x512 (configurable but not runtime)
-4. **No pre-trained weights**: Uses random initialization
-5. **Single-threaded**: No parallel processing
-6. **English-centric**: Comments and docs in English only
+4. **No pre-trained weights**: Uses random initialization (intentional — see Design Philosophy)
+5. **Generation rate capped by audio**: 0.5s chunks = max 2 frames/sec of audio coverage
+6. **Single-threaded**: No parallel processing
+7. **English-centric**: Comments and docs in English only
 
 ---
 
@@ -419,16 +432,17 @@ def callback(indata, frames, time, status):
 
 **Tested on**: Modern x86_64 CPU (4 cores, 2.5GHz)
 
-- Model initialization: 1-2 seconds (first run)
-- Per-frame generation: 0.5-1.0 seconds
-- Throughput: 30-60 FPS
-- Memory usage: 80-100 MB (steady state)
-- Model size on disk: 15-20 MB
+- Model initialization: <1 second
+- Per-frame generation: 0.2-0.5 seconds (2-5 FPS generation rate)
+- Audio chunk rate: 2 frames/sec at 0.5s chunks (hard limit from audio input)
+- Playback FPS: 30+ (frames are pre-generated, then played back at any rate)
+- Memory usage: 50-80 MB (steady state)
+- Model size on disk: 2-4 MB
 
 **Bottlenecks**:
-1. Librosa feature extraction (~40% of time)
-2. Neural network forward pass (~30% of time)
-3. Glitch effects (~20% of time)
+1. Librosa feature extraction (~50% of time)
+2. Conv decoder forward pass (~25% of time)
+3. Glitch effects (~15% of time)
 4. I/O (PNG save) (~10% of time)
 
 ---
@@ -459,14 +473,14 @@ To recreate this project from scratch using Claude:
 1. Show Claude this README
 2. Request: "Create DoggyNeuralGlitch based on this specification"
 3. Claude will generate all files with proper structure
-4. Test with: `python test.py`
+4. Test with: `uv run test.py`
 
 Key points to emphasize:
 - Demoscene philosophy (small, fast, cool)
 - CPU-only operation
 - Random weights (no training needed)
 - Audio-driven effects
-- ~100MB RAM budget
+- Conv decoder (~400k params, ~2-4MB, ~50-80MB RAM)
 
 ---
 
