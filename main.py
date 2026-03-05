@@ -5,6 +5,7 @@ import librosa
 import numpy as np
 import torch
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 
 from config import BANNER, Config
@@ -85,22 +86,89 @@ class DoggyNeuralGlitch:
             'raw_bytes': raw_bytes,
         }
 
-    def generate_frame(self, features: dict, mode: str) -> np.ndarray:
-        if mode == 'chaos':
-            seed = int(features['intensity'] * 1_000_000)
-            torch.manual_seed(seed)
-            z = torch.randn(1, self.config.LATENT_DIM)
-        else:
-            x = torch.tensor(features['mfcc_vec']).unsqueeze(0)
-            with torch.no_grad():
-                z, _, _ = self.model.encode(x)
+    def _generate_plasma(self, features: dict) -> np.ndarray:
+        """Audio-driven plasma: sum of sine waves keyed to MFCC/band values."""
+        h, w = self.config.IMAGE_SIZE
+        mfcc = features['mfcc_vec']
+        bass, mid, treble = features['bass'], features['mid'], features['treble']
+        intensity = features['intensity']
 
+        x = np.linspace(0, 2 * np.pi, w, dtype=np.float32)
+        y = np.linspace(0, 2 * np.pi, h, dtype=np.float32)
+        xx, yy = np.meshgrid(x, y)
+
+        # Bass → low-freq red structure; mid → green rhythm; treble → blue detail
+        r = (np.sin(xx * (bass * 4 + 1) + mfcc[0] * np.pi) +
+             np.sin(yy * (mid  * 2 + 0.5) + mfcc[1] * np.pi)) * 0.5
+        g = (np.sin(yy * (mid  * 4 + 1) + mfcc[2] * np.pi) +
+             np.cos(xx * (treble * 2 + 0.5) + mfcc[3] * np.pi)) * 0.5
+        b = (np.cos((xx + yy) * (treble * 3 + 1) + mfcc[4] * np.pi) +
+             np.sin(xx * yy * intensity * 2 + mfcc[5] * np.pi)) * 0.5
+
+        img = np.stack([r, g, b], axis=2)
+        return ((img + 1) * 127.5).clip(0, 255).astype(np.uint8)
+
+    def _vae_texture(self, features: dict) -> np.ndarray:
+        """VAE decode: used as an additive texture layer over the plasma base."""
+        x = torch.tensor(features['mfcc_vec']).unsqueeze(0)
         with torch.no_grad():
+            z, _, _ = self.model.encode(x)
             img_tensor = self.model.decode(z)
-
-        # Denormalize [-1, 1] -> [0, 255]
         img_np = img_tensor.squeeze(0).permute(1, 2, 0).numpy()
         return ((img_np + 1) * 127.5).clip(0, 255).astype(np.uint8)
+
+    def _generate_drakonix(self, features: dict) -> np.ndarray:
+        """Fursona palette stripes + audio-driven Perlin-style noise — ported from favicon.rs."""
+        h, w = self.config.IMAGE_SIZE
+        palette = self.config.COLOR_PALETTES['drakonix']
+        mfcc = features['mfcc_vec']
+        bass, mid, treble = features['bass'], features['mid'], features['treble']
+        intensity = features['intensity']
+
+        # Audio-driven parameters mirroring the favicon generator's random choices:
+        #   spectral centroid → stripe direction  (favicon: rng.gen_bool(0.5))
+        #   bass              → stripe count 3–6  (favicon: rng.gen_range(3..=6))
+        #   treble            → noise scale 3–9   (favicon: rng.gen_range(3.0..9.0))
+        #   intensity         → noise strength 25–70 (favicon: rng.gen_range(25.0..70.0))
+        horizontal = features['spectral_centroid'] > 0.5
+        num_stripes = int(bass * 3 + 3)  # 3–6
+        noise_scale = treble * 6 + 3     # 3–9
+        noise_strength = intensity * 45 + 25  # 25–70
+
+        # Assign one palette color per stripe, keyed by MFCC so it's audio-deterministic
+        stripe_colors = [
+            palette[int(abs(mfcc[i % len(mfcc)]) * len(palette)) % len(palette)]
+            for i in range(num_stripes)
+        ]
+
+        img = np.zeros((h, w, 3), dtype=np.float32)
+        for y in range(h):
+            for x in range(w):
+                axis = y if horizontal else x
+                size = h if horizontal else w
+                idx = min(int((axis / size) * num_stripes), num_stripes - 1)
+                img[y, x] = stripe_colors[idx]
+
+        # Perlin-like noise: gaussian-smoothed random field, same technique as favicon.rs
+        raw_noise = np.random.randn(h, w).astype(np.float32)
+        smooth = gaussian_filter(raw_noise, sigma=max(noise_scale, 0.1))
+        smooth = smooth / (smooth.std() + 1e-8)  # normalise to ~[-1, 1]
+        shift = (smooth * noise_strength)[..., np.newaxis]  # (h, w, 1)
+
+        img = np.clip(img + shift, 0, 255).astype(np.uint8)
+        return img
+
+    def generate_frame(self, features: dict, mode: str) -> np.ndarray:
+        plasma = self._generate_plasma(features)
+
+        if mode == 'chaos':
+            # Pure plasma seeded by audio intensity — no VAE
+            return plasma
+
+        # Neural mode: blend plasma (color/structure) with VAE (texture)
+        vae = self._vae_texture(features)
+        blended = (plasma.astype(np.float32) * 0.7 + vae.astype(np.float32) * 0.3)
+        return blended.clip(0, 255).astype(np.uint8)
 
     def process(self, audio_path: str, output_dir: str, mode: str = 'mixed',
                 max_frames: int = None, chunk_duration: float = None):
@@ -121,6 +189,9 @@ class DoggyNeuralGlitch:
     def _generate_and_glitch(self, features: dict, mode: str) -> np.ndarray:
         if mode == 'chaos':
             return self.generate_frame(features, 'chaos')
+        if mode == 'drakonix':
+            img = self._generate_drakonix(features)
+            return self.glitcher.apply_audio_driven_glitches(img, features, 'mixed')
         # All other modes: neural base + effect pass
         img = self.generate_frame(features, 'neural')
         effect_mode = mode if mode != 'neural' else 'mixed'
@@ -138,7 +209,7 @@ def main():
                         help='Output directory for PNG frames')
     parser.add_argument('--mode', default='mixed',
                         choices=['neural', 'chaos', 'mixed',
-                                 'bitcrush', 'rgb_split', 'datamosh'],
+                                 'bitcrush', 'rgb_split', 'datamosh', 'drakonix'],
                         help='Generation mode (default: mixed)')
     parser.add_argument('--max-frames', type=int, default=None,
                         help='Maximum number of frames to generate')

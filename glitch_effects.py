@@ -129,13 +129,13 @@ class AudioDrivenGlitcher:
     def _apply_mixed(self, img, intensity, bass, mid, treble, centroid,
                      audio_bytes):
         # Structural changes first
-        if bass > 0.6:
+        if bass > 0.3:
             img = GlitchEffects.block_glitch(img, bass)
         # Detail changes
-        if treble > 0.5:
+        if treble > 0.25:
             img = GlitchEffects.rgb_split(img, intensity, centroid)
         # Tonal changes
-        if mid > 0.4:
+        if mid > 0.2:
             img = GlitchEffects.bitcrush(img, mid)
         # Always apply chromatic aberration
         img = GlitchEffects.chromatic_aberration(img, intensity)

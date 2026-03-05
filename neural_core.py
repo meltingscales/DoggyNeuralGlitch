@@ -61,9 +61,9 @@ class TinyVAE(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.ConvTranspose2d)):
-                nn.init.xavier_normal_(m.weight, gain=0.5)
+                nn.init.xavier_normal_(m.weight, gain=2.0)
                 if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                    nn.init.normal_(m.bias, std=0.1)
 
     def reparameterize(self, mean: torch.Tensor,
                        logvar: torch.Tensor) -> torch.Tensor:
